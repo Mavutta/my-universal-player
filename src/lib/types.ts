@@ -6,6 +6,9 @@ export interface Track {
   album: string;
   genre: string;
   duration: number;
+  sampleRate?: number;
+  playCount: number;
+  addedAt: number;
   coverUrl?: string;
   format: string;
   trackNumber?: number;
@@ -41,5 +44,5 @@ export interface PlayerState {
   isRepeat: boolean;
   currentTime: number;
   duration: number;
-  activeTab: 'tracks' | 'albums' | 'artists' | 'genres' | 'playlists' | 'folders' | 'settings' | 'favorites' | 'console';
+  activeTab: 'tracks' | 'albums' | 'artists' | 'genres' | 'playlists' | 'folders' | 'settings' | 'favorites' | 'console' | 'recentlyAdded' | 'mostPlayed' | 'highResOnly';
 }

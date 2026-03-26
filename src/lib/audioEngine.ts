@@ -25,9 +25,21 @@ export class AudioEngine {
   private frequencies = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 
   constructor(audio1: HTMLAudioElement, audio2: HTMLAudioElement) {
-    this.context = new (window.AudioContext || (window as any).webkitAudioContext)();
+    // 1. Audiophile Audio Stack
+    let sampleRate = 48000;
+    try {
+      const tempCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      if (tempCtx.sampleRate >= 192000) sampleRate = 192000;
+      else if (tempCtx.sampleRate >= 96000) sampleRate = 96000;
+      tempCtx.close();
+    } catch (e) {}
+
+    this.context = new (window.AudioContext || (window as any).webkitAudioContext)({
+      sampleRate,
+      latencyHint: 'playback'
+    });
     
-    // 1. Sources & Crossfade Gains
+    // 2. Sources & Crossfade Gains
     this.source1 = this.context.createMediaElementSource(audio1);
     this.source2 = this.context.createMediaElementSource(audio2);
     this.gain1 = this.context.createGain();
@@ -35,21 +47,21 @@ export class AudioEngine {
     this.gain1.gain.value = 1;
     this.gain2.gain.value = 0;
 
-    // 2. Pre-Amp
+    // 3. Pre-Amp (-15dB to +15dB)
     this.preAmp = this.context.createGain();
     this.preAmp.gain.value = 1; // 0dB
 
-    // 3. 10-Band EQ
+    // 4. 10-Band Parametric EQ
     this.frequencies.forEach((freq, i) => {
       const filter = this.context.createBiquadFilter();
       filter.type = i === 0 ? 'lowshelf' : i === this.frequencies.length - 1 ? 'highshelf' : 'peaking';
       filter.frequency.value = freq;
-      filter.Q.value = 1.414; // Higher Q for surgical precision
+      filter.Q.value = 1.414;
       filter.gain.value = 0;
       this.eqFilters.push(filter);
     });
 
-    // 4. Dynamics Compressor
+    // 5. Dynamics Compressor (Dynamics Processor)
     this.compressor = this.context.createDynamicsCompressor();
     this.compressor.threshold.value = -24;
     this.compressor.knee.value = 30;
@@ -57,7 +69,7 @@ export class AudioEngine {
     this.compressor.attack.value = 0.003;
     this.compressor.release.value = 0.25;
 
-    // 5. Stereo Widener & Mono Logic
+    // 6. Stereo Expander & Mono Logic
     this.splitter = this.context.createChannelSplitter(2);
     this.merger = this.context.createChannelMerger(2);
     this.leftDelay = this.context.createDelay();
@@ -67,23 +79,23 @@ export class AudioEngine {
     this.widenerOutput = this.context.createGain();
 
     this.leftDelay.delayTime.value = 0;
-    this.rightDelay.delayTime.value = 0.02; // 20ms offset for widening
+    this.rightDelay.delayTime.value = 0.02; 
     this.stereoGain.gain.value = 1;
     this.monoGain.gain.value = 0;
 
-    // 6. Master Limiter (Soft Limiter)
+    // 7. Master Soft Limiter (Zero Clipping)
     this.limiter = this.context.createDynamicsCompressor();
-    this.limiter.threshold.value = -0.5; // Just below 0dB
-    this.limiter.knee.value = 0; // Hard knee for limiting
-    this.limiter.ratio.value = 20; // High ratio for limiting
-    this.limiter.attack.value = 0.001; // Fast attack
+    this.limiter.threshold.value = -1.0; 
+    this.limiter.knee.value = 0; 
+    this.limiter.ratio.value = 20; 
+    this.limiter.attack.value = 0.003; 
     this.limiter.release.value = 0.1;
 
-    // 7. Analyzer
+    // 8. Analyzer
     this.analyzer = this.context.createAnalyser();
-    this.analyzer.fftSize = 1024; // Higher resolution for console visualizer
+    this.analyzer.fftSize = 1024;
 
-    // --- Connections ---
+    // --- Connections (32-bit Float Signal Chain) ---
     this.source1.connect(this.gain1);
     this.source2.connect(this.gain2);
     this.gain1.connect(this.preAmp);
@@ -96,35 +108,30 @@ export class AudioEngine {
       lastNode = filter;
     });
 
-    // Compressor
+    // Dynamics Processor
     lastNode.connect(this.compressor);
     lastNode = this.compressor;
 
-    // Stereo/Mono/Widener Path
+    // Stereo Expander Path
     lastNode.connect(this.splitter);
     
-    // Stereo Path (Default)
-    this.splitter.connect(this.merger, 0, 0); // Left to Left
-    this.splitter.connect(this.merger, 1, 1); // Right to Right
+    // Normal Stereo
+    this.splitter.connect(this.merger, 0, 0);
+    this.splitter.connect(this.merger, 1, 1);
     
-    // Widener Path
+    // Expanded Stereo
     this.splitter.connect(this.leftDelay, 0);
     this.splitter.connect(this.rightDelay, 1);
     this.leftDelay.connect(this.merger, 0, 0);
     this.rightDelay.connect(this.merger, 0, 1);
     
-    // Mono Path
-    this.monoGain = this.context.createGain();
-    this.monoGain.gain.value = 0;
+    // Mono Sum
     const monoSum = this.context.createGain();
     monoSum.gain.value = 0.5;
     this.splitter.connect(monoSum, 0);
     this.splitter.connect(monoSum, 1);
     monoSum.connect(this.monoGain);
     
-    // Final routing for widener/mono
-    this.stereoGain = this.context.createGain();
-    this.stereoGain.gain.value = 1;
     this.merger.connect(this.stereoGain);
     this.stereoGain.connect(this.widenerOutput);
     this.monoGain.connect(this.widenerOutput);
@@ -135,11 +142,11 @@ export class AudioEngine {
     this.widenerOutput.connect(this.normalizationGain);
     lastNode = this.normalizationGain;
 
-    // Limiter
+    // Soft Limiter
     lastNode.connect(this.limiter);
     lastNode = this.limiter;
 
-    // End of Chain
+    // Output
     lastNode.connect(this.analyzer);
     this.analyzer.connect(this.context.destination);
   }

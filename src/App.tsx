@@ -6,7 +6,7 @@ import {
   GripVertical, LayoutGrid, Users, Folder, Settings,
   ChevronRight, ChevronDown, FolderOpen, Sliders,
   Check, Save, RotateCcw, Maximize2, Minimize2,
-  Library, Mic2, Zap
+  Library, Mic2, Zap, Clock, TrendingUp, Award
 } from 'lucide-react';
 import { motion, AnimatePresence, Reorder } from 'motion/react';
 import { useLiveQuery } from 'dexie-react-hooks';
@@ -91,6 +91,7 @@ export default function App() {
   const engineRef = useRef<AudioEngine | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const activeAudioRef = useRef<1 | 2>(1);
+  const preloadedTrackIdRef = useRef<string | null>(null);
 
   const currentTrack = currentIndex >= 0 ? nowPlayingQueue[currentIndex] : null;
 
@@ -124,6 +125,19 @@ export default function App() {
   const favoriteTracks = useMemo(() => {
     return tracks.filter(t => favorites.has(t.id));
   }, [tracks, favorites]);
+
+  const recentlyAdded = useMemo(() => {
+    return [...tracks].sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0)).slice(0, 50);
+  }, [tracks]);
+
+  const mostPlayed = useMemo(() => {
+    return [...tracks].sort((a, b) => (b.playCount || 0) - (a.playCount || 0)).filter(t => (t.playCount || 0) > 0).slice(0, 50);
+  }, [tracks]);
+
+  const highResOnly = useMemo(() => {
+    return tracks.filter(t => (t.sampleRate || 0) > 48000);
+  }, [tracks]);
+
   const albums = useMemo(() => {
     const groups: Record<string, Track[]> = {};
     tracks.forEach(t => {
@@ -198,7 +212,10 @@ export default function App() {
         format: metadata.format || file.type || ext || 'unknown',
         trackNumber: metadata.trackNumber,
         path: (file as any).webkitRelativePath || file.name,
-        isFavorite: false
+        isFavorite: false,
+        playCount: 0,
+        addedAt: Date.now(),
+        sampleRate: metadata.sampleRate || 0
       };
       newTracks.push(track);
     }
@@ -239,6 +256,27 @@ export default function App() {
     if (audio2Ref.current) audio2Ref.current.src = '';
   };
 
+  const preloadNextTrack = async (track: Track) => {
+    preloadedTrackIdRef.current = track.id;
+    const nextAudio = activeAudioRef.current === 1 ? audio2Ref.current : audio1Ref.current;
+    if (!nextAudio) return;
+
+    let url: string;
+    if (isNativelySupported(track.file)) {
+      url = URL.createObjectURL(track.file);
+    } else {
+      try {
+        const wavBlob = await decodeToWav(track.file);
+        url = URL.createObjectURL(wavBlob);
+      } catch (err) {
+        console.error('Pre-decoding failed', err);
+        return;
+      }
+    }
+    nextAudio.src = url;
+    nextAudio.load();
+  };
+
   const playTrack = useCallback(async (track: Track, queue: Track[] = tracks) => {
     setNowPlayingQueue(queue);
     const index = queue.findIndex(t => t.id === track.id);
@@ -248,25 +286,27 @@ export default function App() {
 
     if (!nextAudio || !currentAudio) return;
 
-    let url: string;
-    if (isNativelySupported(track.file)) {
-      url = URL.createObjectURL(track.file);
-    } else {
-      setIsLoading(true);
-      try {
-        const wavBlob = await decodeToWav(track.file);
-        url = URL.createObjectURL(wavBlob);
-      } catch (err) {
-        console.error('Decoding failed', err);
+    // Check if already pre-loaded
+    if (preloadedTrackIdRef.current !== track.id) {
+      let url: string;
+      if (isNativelySupported(track.file)) {
+        url = URL.createObjectURL(track.file);
+      } else {
+        setIsLoading(true);
+        try {
+          const wavBlob = await decodeToWav(track.file);
+          url = URL.createObjectURL(wavBlob);
+        } catch (err) {
+          console.error('Decoding failed', err);
+          setIsLoading(false);
+          return;
+        }
         setIsLoading(false);
-        return;
       }
-      setIsLoading(false);
+      nextAudio.src = url;
+      nextAudio.load();
     }
 
-    nextAudio.src = url;
-    nextAudio.load();
-    
     if (audioSettings.crossfadeTime > 0) {
       engineRef.current?.crossfade(activeAudioRef.current === 1 ? 2 : 1, audioSettings.crossfadeTime);
       nextAudio.play();
@@ -286,6 +326,10 @@ export default function App() {
     setCurrentIndex(index);
     setIsPlaying(true);
     engineRef.current?.resume();
+    preloadedTrackIdRef.current = null; // Reset pre-load ref
+
+    // Increment play count
+    await db.tracks.update(track.id, { playCount: (track.playCount || 0) + 1 });
   }, [tracks, audioSettings.crossfadeTime]);
 
   const togglePlay = () => {
@@ -404,6 +448,15 @@ export default function App() {
       if ((activeAudioRef.current === 1 && audio === audio1) || (activeAudioRef.current === 2 && audio === audio2)) {
         setCurrentTime(audio.currentTime);
         setDuration(audio.duration);
+
+        // Pre-load next track 5 seconds before end
+        if (audio.duration > 0 && audio.duration - audio.currentTime < 5) {
+          const nextIndex = (currentIndex + 1) % nowPlayingQueue.length;
+          const nextTrack = nowPlayingQueue[nextIndex];
+          if (nextTrack && preloadedTrackIdRef.current !== nextTrack.id) {
+            preloadNextTrack(nextTrack);
+          }
+        }
       }
     };
 
@@ -596,8 +649,6 @@ export default function App() {
             ))}
           </div>
         );
-      case 'folders':
-        return <FolderBrowser tree={folderTree} onPlayTrack={(t) => playTrack(t, tracks)} />;
       case 'genres':
         return (
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6 pb-32">
@@ -665,6 +716,135 @@ export default function App() {
         );
       case 'settings':
         return <SettingsView settings={audioSettings} onUpdate={setAudioSettings} onReset={() => db.tracks.clear()} />;
+      case 'folders':
+        return (
+          <div className="space-y-6 pb-32">
+            <div className="flex items-center justify-between mb-8">
+              <h2 className="text-3xl font-bold flex items-center gap-3">
+                <Folder className="text-emerald-500" size={32} />
+                Folder Browser
+              </h2>
+            </div>
+            <FolderBrowser tree={folderTree} onPlayTrack={(t) => playTrack(t, tracks)} />
+          </div>
+        );
+      case 'recentlyAdded':
+        return (
+          <div className="space-y-6 pb-32">
+            <div className="flex items-center justify-between mb-8">
+              <h2 className="text-3xl font-bold flex items-center gap-3">
+                <Clock className="text-emerald-500" size={32} />
+                Recently Added
+              </h2>
+              <button 
+                onClick={() => recentlyAdded.length > 0 && playTrack(recentlyAdded[0], recentlyAdded)}
+                className="px-6 py-3 bg-emerald-500 text-black rounded-xl font-bold hover:bg-emerald-400 transition-colors flex items-center gap-2"
+              >
+                <Play size={20} fill="currentColor" />
+                Play All
+              </button>
+            </div>
+            <div className="space-y-2">
+              {recentlyAdded.map((track) => (
+                <TrackItem 
+                  key={track.id} 
+                  track={track} 
+                  isActive={currentTrack?.id === track.id}
+                  isSelected={selectedTrackIds.has(track.id)}
+                  isFavorite={favorites.has(track.id)}
+                  onClick={() => playTrack(track, recentlyAdded)}
+                  onSelect={() => toggleTrackSelection(track.id)}
+                  onToggleFavorite={() => toggleFavorite(track.id)}
+                  isPlaying={isPlaying}
+                  onAddToPlaylist={() => {
+                    setTracksToAddToPlaylist([track]);
+                    setIsAddToPlaylistModalOpen(true);
+                  }}
+                  onPlayNext={() => playNextTrack(track)}
+                  onAddToQueue={() => addToQueue(track)}
+                />
+              ))}
+            </div>
+          </div>
+        );
+      case 'mostPlayed':
+        return (
+          <div className="space-y-6 pb-32">
+            <div className="flex items-center justify-between mb-8">
+              <h2 className="text-3xl font-bold flex items-center gap-3">
+                <Zap className="text-emerald-500" size={32} />
+                Most Played
+              </h2>
+              <button 
+                onClick={() => mostPlayed.length > 0 && playTrack(mostPlayed[0], mostPlayed)}
+                className="px-6 py-3 bg-emerald-500 text-black rounded-xl font-bold hover:bg-emerald-400 transition-colors flex items-center gap-2"
+              >
+                <Play size={20} fill="currentColor" />
+                Play All
+              </button>
+            </div>
+            <div className="space-y-2">
+              {mostPlayed.map((track) => (
+                <TrackItem 
+                  key={track.id} 
+                  track={track} 
+                  isActive={currentTrack?.id === track.id}
+                  isSelected={selectedTrackIds.has(track.id)}
+                  isFavorite={favorites.has(track.id)}
+                  onClick={() => playTrack(track, mostPlayed)}
+                  onSelect={() => toggleTrackSelection(track.id)}
+                  onToggleFavorite={() => toggleFavorite(track.id)}
+                  isPlaying={isPlaying}
+                  onAddToPlaylist={() => {
+                    setTracksToAddToPlaylist([track]);
+                    setIsAddToPlaylistModalOpen(true);
+                  }}
+                  onPlayNext={() => playNextTrack(track)}
+                  onAddToQueue={() => addToQueue(track)}
+                />
+              ))}
+            </div>
+          </div>
+        );
+      case 'highResOnly':
+        return (
+          <div className="space-y-6 pb-32">
+            <div className="flex items-center justify-between mb-8">
+              <h2 className="text-3xl font-bold flex items-center gap-3">
+                <Music size={32} className="text-emerald-500" />
+                High-Res Only
+              </h2>
+              <button 
+                onClick={() => highResOnly.length > 0 && playTrack(highResOnly[0], highResOnly)}
+                className="px-6 py-3 bg-emerald-500 text-black rounded-xl font-bold hover:bg-emerald-400 transition-colors flex items-center gap-2"
+              >
+                <Play size={20} fill="currentColor" />
+                Play All
+              </button>
+            </div>
+            <div className="space-y-2">
+              {highResOnly.map((track) => (
+                <TrackItem 
+                  key={track.id} 
+                  track={track} 
+                  isActive={currentTrack?.id === track.id}
+                  isSelected={selectedTrackIds.has(track.id)}
+                  isFavorite={favorites.has(track.id)}
+                  onClick={() => playTrack(track, highResOnly)}
+                  onSelect={() => toggleTrackSelection(track.id)}
+                  onToggleFavorite={() => toggleFavorite(track.id)}
+                  isPlaying={isPlaying}
+                  onAddToPlaylist={() => {
+                    setTracksToAddToPlaylist([track]);
+                    setIsAddToPlaylistModalOpen(true);
+                  }}
+                  onPlayNext={() => playNextTrack(track)}
+                  onAddToQueue={() => addToQueue(track)}
+                />
+              ))}
+            </div>
+          </div>
+        );
       case 'console':
         return <AudioConsole settings={audioSettings} onUpdate={setAudioSettings} analyzer={engineRef.current?.getAnalyzer() || null} />;
       default:
@@ -736,6 +916,9 @@ export default function App() {
       <div className="relative z-30">
         <nav className="h-20 bg-white/5 backdrop-blur-2xl border-t border-white/10 flex items-center md:justify-around justify-start overflow-x-auto no-scrollbar px-6 scroll-smooth nav-mask md:[mask-image:none]">
           <NavButton icon={<Music />} label="Tracks" active={activeTab === 'tracks'} onClick={() => setActiveTab('tracks')} />
+          <NavButton icon={<Clock />} label="Recent" active={activeTab === 'recentlyAdded'} onClick={() => setActiveTab('recentlyAdded')} />
+          <NavButton icon={<TrendingUp />} label="Top" active={activeTab === 'mostPlayed'} onClick={() => setActiveTab('mostPlayed')} />
+          <NavButton icon={<Award />} label="Hi-Res" active={activeTab === 'highResOnly'} onClick={() => setActiveTab('highResOnly')} />
           <NavButton icon={<LayoutGrid />} label="Albums" active={activeTab === 'albums'} onClick={() => setActiveTab('albums')} />
           <NavButton icon={<Users />} label="Artists" active={activeTab === 'artists'} onClick={() => setActiveTab('artists')} />
           <NavButton icon={<Heart />} label="Favorites" active={activeTab === 'favorites'} onClick={() => setActiveTab('favorites')} />
@@ -1262,7 +1445,14 @@ function TrackItem({
             <span className="px-1 py-0.5 bg-emerald-500/10 text-emerald-500 text-[7px] font-bold rounded uppercase tracking-widest border border-emerald-500/20 flex-shrink-0">Hi-Res</span>
           )}
         </div>
-        <p className="text-sm text-white/40 truncate">{track.artist} • {track.album}</p>
+        <div className="flex items-center gap-2 text-xs text-white/40 truncate">
+          <span>{track.artist} • {track.album}</span>
+          {track.playCount && track.playCount > 0 && (
+            <span className="flex items-center gap-1 text-[10px] bg-white/5 px-1.5 rounded-full">
+              <Zap size={10} className="text-emerald-500" /> {track.playCount}
+            </span>
+          )}
+        </div>
       </div>
       
       <div className="flex items-center gap-3">
@@ -1499,12 +1689,18 @@ function SettingsView({ settings, onUpdate, onReset }: { settings: AudioSettings
       </section>
 
       <section className="pt-6 border-t border-white/10">
-        <button 
-          onClick={onReset}
-          className="px-6 py-3 bg-red-500/10 text-red-500 border border-red-500/20 rounded-xl font-semibold hover:bg-red-500 hover:text-white transition-all flex items-center gap-2"
-        >
-          <Trash2 size={18} /> Clear Library Cache
-        </button>
+        <div className="bg-red-500/5 border border-red-500/10 rounded-2xl p-6 flex items-center justify-between">
+          <div>
+            <h3 className="font-bold text-red-500">Danger Zone</h3>
+            <p className="text-xs text-red-500/40">This will permanently delete your library database</p>
+          </div>
+          <button 
+            onClick={onReset}
+            className="px-6 py-3 bg-red-500 text-white rounded-xl font-bold hover:bg-red-400 transition-all flex items-center gap-2"
+          >
+            <Trash2 size={18} /> Clear Library
+          </button>
+        </div>
       </section>
     </div>
   );

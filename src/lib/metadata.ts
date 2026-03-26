@@ -3,6 +3,7 @@ import { Track } from './types';
 
 export async function extractMetadata(file: File): Promise<Partial<Track>> {
   try {
+    // Try music-metadata-browser first as it's more comprehensive
     const metadata = await mm.parseBlob(file);
     const { common, format } = metadata;
     
@@ -19,6 +20,9 @@ export async function extractMetadata(file: File): Promise<Partial<Track>> {
       album: common.album || 'Unknown Album',
       genre: common.genre?.[0] || 'Unknown Genre',
       duration: format.duration || 0,
+      sampleRate: format.sampleRate,
+      playCount: 0,
+      addedAt: Date.now(),
       coverUrl,
       format: format.container || file.type || 'audio/unknown',
       trackNumber: common.track.no || undefined,
