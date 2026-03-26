@@ -10,6 +10,7 @@ export interface Track {
   format: string;
   trackNumber?: number;
   path?: string; // For folder navigation
+  isFavorite?: boolean;
 }
 
 export interface Playlist {
@@ -34,5 +35,5 @@ export interface PlayerState {
   isRepeat: boolean;
   currentTime: number;
   duration: number;
-  activeTab: 'tracks' | 'albums' | 'artists' | 'genres' | 'playlists' | 'folders' | 'settings';
+  activeTab: 'tracks' | 'albums' | 'artists' | 'genres' | 'playlists' | 'folders' | 'settings' | 'favorites';
 }

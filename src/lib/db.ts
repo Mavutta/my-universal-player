@@ -7,8 +7,8 @@ export class SonicDB extends Dexie {
 
   constructor() {
     super('SonicDB');
-    this.version(1).stores({
-      tracks: '++id, title, artist, album, genre, path',
+    this.version(2).stores({
+      tracks: '++id, title, artist, album, genre, path, isFavorite',
       playlists: '++id, name, createdAt'
     });
   }

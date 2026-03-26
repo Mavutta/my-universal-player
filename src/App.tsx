@@ -44,6 +44,18 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isPlayerExpanded, setIsPlayerExpanded] = useState(false);
+  const [isNewPlaylistModalOpen, setIsNewPlaylistModalOpen] = useState(false);
+  const [newPlaylistName, setNewPlaylistName] = useState('');
+  const [tracksToAddToPlaylist, setTracksToAddToPlaylist] = useState<Track[]>([]);
+  const [isAddToPlaylistModalOpen, setIsAddToPlaylistModalOpen] = useState(false);
+  const [isDeleteConfirmationModalOpen, setIsDeleteConfirmationModalOpen] = useState(false);
+  const [isEQModalOpen, setIsEQModalOpen] = useState(false);
+  const [selectedPlaylistId, setSelectedPlaylistId] = useState<string>('');
+  const [selectedTrackIds, setSelectedTrackIds] = useState<Set<string>>(new Set());
+  const [favorites, setFavorites] = useState<Set<string>>(() => {
+    const saved = localStorage.getItem('favorites');
+    return saved ? new Set(JSON.parse(saved)) : new Set();
+  });
   
   // Audio Settings
   const [audioSettings, setAudioSettings] = useState<AudioSettings>(() => {
@@ -84,7 +96,14 @@ export default function App() {
     }
   }, [audioSettings]);
 
+  useEffect(() => {
+    localStorage.setItem('favorites', JSON.stringify(Array.from(favorites)));
+  }, [favorites]);
+
   // --- Library Logic ---
+  const favoriteTracks = useMemo(() => {
+    return tracks.filter(t => favorites.has(t.id));
+  }, [tracks, favorites]);
   const albums = useMemo(() => {
     const groups: Record<string, Track[]> = {};
     tracks.forEach(t => {
@@ -139,23 +158,62 @@ export default function App() {
     if (files.length === 0) return;
 
     setIsLoading(true);
+    const newTracks: Track[] = [];
     for (const file of files) {
+      if (!file.type.startsWith('audio/') && !file.name.match(/\.(mp3|wav|ogg|flac|m4a)$/i)) continue;
+      
       const metadata = await extractMetadata(file);
-      await db.tracks.add({
-        id: Math.random().toString(36).substr(2, 9),
+      const track: Track = {
+        id: crypto.randomUUID(),
         file,
-        title: metadata.title || file.name,
+        title: metadata.title || file.name.replace(/\.[^/.]+$/, ""),
         artist: metadata.artist || 'Unknown Artist',
         album: metadata.album || 'Unknown Album',
         genre: metadata.genre || 'Unknown Genre',
         duration: metadata.duration || 0,
         coverUrl: metadata.coverUrl,
-        format: file.type,
+        format: metadata.format || file.type,
         trackNumber: metadata.trackNumber,
         path: (file as any).webkitRelativePath || file.name,
-      });
+        isFavorite: false
+      };
+      newTracks.push(track);
+    }
+    
+    if (newTracks.length > 0) {
+      await db.tracks.bulkAdd(newTracks);
     }
     setIsLoading(false);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const toggleFavorite = async (trackId: string) => {
+    const newFavorites = new Set(favorites);
+    if (newFavorites.has(trackId)) {
+      newFavorites.delete(trackId);
+    } else {
+      newFavorites.add(trackId);
+    }
+    setFavorites(newFavorites);
+    await db.tracks.update(trackId, { isFavorite: newFavorites.has(trackId) });
+  };
+
+  const playNextTrack = (track: Track) => {
+    const newQueue = [...nowPlayingQueue];
+    newQueue.splice(currentIndex + 1, 0, track);
+    setNowPlayingQueue(newQueue);
+  };
+
+  const addToQueue = (track: Track) => {
+    setNowPlayingQueue([...nowPlayingQueue, track]);
+  };
+
+  const clearQueue = () => {
+    setNowPlayingQueue([]);
+    setCurrentIndex(-1);
+    setIsPlaying(false);
+    if (audio1Ref.current) audio1Ref.current.src = '';
+    if (audio2Ref.current) audio2Ref.current.src = '';
   };
 
   const playTrack = useCallback(async (track: Track, queue: Track[] = tracks) => {
@@ -215,7 +273,7 @@ export default function App() {
     setIsPlaying(!isPlaying);
   };
 
-  const playNext = useCallback(() => {
+  const skipNext = useCallback(() => {
     if (nowPlayingQueue.length === 0) return;
     let nextIndex;
     if (isShuffle) {
@@ -230,6 +288,86 @@ export default function App() {
     if (nowPlayingQueue.length === 0) return;
     const prevIndex = (currentIndex - 1 + nowPlayingQueue.length) % nowPlayingQueue.length;
     playTrack(nowPlayingQueue[prevIndex], nowPlayingQueue);
+  };
+
+  const createPlaylist = async () => {
+    if (!newPlaylistName.trim()) return;
+    await db.playlists.add({
+      id: Math.random().toString(36).substr(2, 9),
+      name: newPlaylistName.trim(),
+      trackIds: [],
+      createdAt: Date.now()
+    });
+    setNewPlaylistName('');
+    setIsNewPlaylistModalOpen(false);
+  };
+
+  const addTrackToPlaylist = async (playlistId: string) => {
+    if (tracksToAddToPlaylist.length === 0) return;
+    const playlist = await db.playlists.get(playlistId);
+    if (playlist) {
+      const newTrackIds = tracksToAddToPlaylist.map(t => t.id);
+      const updatedTrackIds = [...new Set([...playlist.trackIds, ...newTrackIds])];
+      await db.playlists.update(playlistId, { trackIds: updatedTrackIds });
+    }
+    setTracksToAddToPlaylist([]);
+    setIsAddToPlaylistModalOpen(false);
+  };
+
+  const handleBulkDelete = async () => {
+    if (selectedTrackIds.size === 0) return;
+    setIsDeleteConfirmationModalOpen(true);
+  };
+
+  const confirmBulkDelete = async () => {
+    const idsToDelete = Array.from(selectedTrackIds);
+    
+    // 1. Delete from DB
+    await db.tracks.bulkDelete(idsToDelete);
+    
+    // 2. Remove from now playing queue
+    const newQueue = nowPlayingQueue.filter(t => !selectedTrackIds.has(t.id));
+    if (newQueue.length !== nowPlayingQueue.length) {
+      if (currentTrack && selectedTrackIds.has(currentTrack.id)) {
+        setIsPlaying(false);
+        setCurrentIndex(-1);
+        if (audio1Ref.current) audio1Ref.current.src = '';
+        if (audio2Ref.current) audio2Ref.current.src = '';
+      }
+      setNowPlayingQueue(newQueue);
+      if (currentTrack && !selectedTrackIds.has(currentTrack.id)) {
+        const newIdx = newQueue.findIndex(t => t.id === currentTrack.id);
+        setCurrentIndex(newIdx);
+      }
+    }
+
+    // 3. Remove from all playlists
+    const allPlaylists = await db.playlists.toArray();
+    for (const p of allPlaylists) {
+      const updatedTrackIds = p.trackIds.filter(id => !selectedTrackIds.has(id));
+      if (updatedTrackIds.length !== p.trackIds.length) {
+        await db.playlists.update(p.id, { trackIds: updatedTrackIds });
+      }
+    }
+
+    setSelectedTrackIds(new Set());
+    setIsDeleteConfirmationModalOpen(false);
+  };
+
+  const handleBulkAddToPlaylist = () => {
+    const selectedTracks = tracks.filter(t => selectedTrackIds.has(t.id));
+    setTracksToAddToPlaylist(selectedTracks);
+    setIsAddToPlaylistModalOpen(true);
+  };
+
+  const toggleTrackSelection = (id: string) => {
+    const newSelection = new Set(selectedTrackIds);
+    if (newSelection.has(id)) {
+      newSelection.delete(id);
+    } else {
+      newSelection.add(id);
+    }
+    setSelectedTrackIds(newSelection);
   };
 
   // --- Audio Events ---
@@ -252,7 +390,7 @@ export default function App() {
         audio.currentTime = 0;
         audio.play();
       } else {
-        playNext();
+        skipNext();
       }
     };
 
@@ -267,7 +405,7 @@ export default function App() {
       audio1.removeEventListener('ended', handleEnded);
       audio2.removeEventListener('ended', handleEnded);
     };
-  }, [playNext, isRepeat]);
+  }, [skipNext, isRepeat]);
 
   // Volume
   useEffect(() => {
@@ -286,16 +424,114 @@ export default function App() {
     switch (activeTab) {
       case 'tracks':
         return (
-          <div className="space-y-2 pb-32">
-            {filteredTracks.map((track) => (
-              <TrackItem 
-                key={track.id} 
-                track={track} 
-                isActive={currentTrack?.id === track.id}
-                onClick={() => playTrack(track, tracks)}
-                isPlaying={isPlaying}
-              />
-            ))}
+          <div className="space-y-4 pb-32">
+            {filteredTracks.length > 0 && (
+              <div className="flex items-center justify-between px-3 py-2 bg-white/5 rounded-xl border border-white/10">
+                <div className="flex items-center gap-3">
+                  <button 
+                    onClick={() => {
+                      if (selectedTrackIds.size === filteredTracks.length) {
+                        setSelectedTrackIds(new Set());
+                      } else {
+                        setSelectedTrackIds(new Set(filteredTracks.map(t => t.id)));
+                      }
+                    }}
+                    className={cn(
+                      "w-5 h-5 rounded border transition-all flex items-center justify-center",
+                      selectedTrackIds.size === filteredTracks.length && filteredTracks.length > 0
+                        ? "bg-emerald-500 border-emerald-500" 
+                        : "border-white/20 hover:border-white/40"
+                    )}
+                  >
+                    {selectedTrackIds.size === filteredTracks.length && filteredTracks.length > 0 && <Check size={14} className="text-black" />}
+                  </button>
+                  <span className="text-sm font-medium text-white/60">
+                    {selectedTrackIds.size > 0 ? `${selectedTrackIds.size} selected` : 'Select All'}
+                  </span>
+                </div>
+                {selectedTrackIds.size > 0 && (
+                  <button 
+                    onClick={() => setSelectedTrackIds(new Set())}
+                    className="text-xs text-white/40 hover:text-white transition-colors"
+                  >
+                    Clear Selection
+                  </button>
+                )}
+              </div>
+            )}
+            <div className="space-y-2">
+              {filteredTracks.map((track) => (
+                <TrackItem 
+                  key={track.id} 
+                  track={track} 
+                  isActive={currentTrack?.id === track.id}
+                  isSelected={selectedTrackIds.has(track.id)}
+                  isFavorite={favorites.has(track.id)}
+                  onClick={() => {
+                    if (selectedTrackIds.size > 0) {
+                      toggleTrackSelection(track.id);
+                    } else {
+                      playTrack(track, tracks);
+                    }
+                  }}
+                  onSelect={() => toggleTrackSelection(track.id)}
+                  onToggleFavorite={() => toggleFavorite(track.id)}
+                  isPlaying={isPlaying}
+                  onAddToPlaylist={() => {
+                    setTracksToAddToPlaylist([track]);
+                    setIsAddToPlaylistModalOpen(true);
+                  }}
+                  onPlayNext={() => playNextTrack(track)}
+                  onAddToQueue={() => addToQueue(track)}
+                />
+              ))}
+            </div>
+          </div>
+        );
+      case 'favorites':
+        return (
+          <div className="space-y-6 pb-32">
+            <div className="flex items-center justify-between mb-8">
+              <h2 className="text-3xl font-bold flex items-center gap-3">
+                <Heart className="text-red-500" fill="currentColor" size={32} />
+                Favorites
+              </h2>
+              <button 
+                onClick={() => favoriteTracks.length > 0 && playTrack(favoriteTracks[0], favoriteTracks)}
+                className="px-6 py-3 bg-red-500 text-white rounded-xl font-bold hover:bg-red-400 transition-colors flex items-center gap-2"
+              >
+                <Play size={20} fill="currentColor" />
+                Play All
+              </button>
+            </div>
+            <div className="space-y-2">
+              {favoriteTracks.length === 0 ? (
+                <div className="text-center py-20 text-white/20">
+                  <Heart size={64} className="mx-auto mb-4 opacity-10" />
+                  <p>No favorites yet. Heart some tracks to see them here!</p>
+                </div>
+              ) : (
+                favoriteTracks.map((track) => (
+                  <TrackItem 
+                    key={track.id} 
+                    track={track} 
+                    isActive={currentTrack?.id === track.id}
+                    isSelected={selectedTrackIds.has(track.id)}
+                    isFavorite={true}
+                    onClick={() => playTrack(track, favoriteTracks)}
+                    onSelect={() => toggleTrackSelection(track.id)}
+                    onToggleFavorite={() => toggleFavorite(track.id)}
+                    isPlaying={isPlaying}
+                    onAddToPlaylist={() => {
+                      setTracksToAddToPlaylist([track]);
+                      setIsAddToPlaylistModalOpen(true);
+                    }}
+                    onPlayNext={() => playNextTrack(track)}
+                    onAddToQueue={() => addToQueue(track)}
+                  />
+                ))
+              )}
+            </div>
           </div>
         );
       case 'albums':
@@ -364,10 +600,7 @@ export default function App() {
             <div className="flex items-center justify-between">
               <h2 className="text-2xl font-bold">Your Playlists</h2>
               <button 
-                onClick={() => {
-                  const name = prompt('Playlist Name:');
-                  if (name) db.playlists.add({ id: Math.random().toString(), name, trackIds: [], createdAt: Date.now() });
-                }}
+                onClick={() => setIsNewPlaylistModalOpen(true)}
                 className="flex items-center gap-2 px-4 py-2 bg-emerald-500 text-black rounded-lg font-semibold hover:bg-emerald-400 transition-colors"
               >
                 <Plus size={18} /> New Playlist
@@ -386,7 +619,15 @@ export default function App() {
                     </div>
                   </div>
                   <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button className="p-2 hover:bg-white/10 rounded-lg"><Play size={18} /></button>
+                    <button 
+                      onClick={() => {
+                        const playlistTracks = tracks.filter(t => p.trackIds.includes(t.id));
+                        if (playlistTracks.length > 0) playTrack(playlistTracks[0], playlistTracks);
+                      }}
+                      className="p-2 hover:bg-white/10 rounded-lg"
+                    >
+                      <Play size={18} />
+                    </button>
                     <button 
                       onClick={() => db.playlists.delete(p.id)}
                       className="p-2 hover:bg-red-500/20 text-white/40 hover:text-red-500 rounded-lg"
@@ -417,7 +658,10 @@ export default function App() {
           <div className="w-10 h-10 bg-emerald-500 rounded-xl flex items-center justify-center shadow-lg shadow-emerald-500/20">
             <Music className="text-black" size={24} />
           </div>
-          <h1 className="text-xl font-bold tracking-tighter">SONIC</h1>
+          <div>
+            <h1 className="text-xl font-bold tracking-tighter">SONIC</h1>
+            <p className="text-[10px] text-white/20 uppercase tracking-[0.2em] font-bold">High-Fidelity Audio</p>
+          </div>
         </div>
         <div className="relative w-96">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-white/20" size={18} />
@@ -432,11 +676,19 @@ export default function App() {
         <div className="flex items-center gap-4">
           <button 
             onClick={() => fileInputRef.current?.click()}
-            className="px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl flex items-center gap-2 transition-all"
+            className="px-4 py-2 bg-white/5 hover:bg-emerald-500 hover:text-black border border-white/10 rounded-xl flex items-center gap-2 transition-all group"
           >
-            <Plus size={18} /> Import
+            <FolderOpen size={18} className="group-hover:scale-110 transition-transform" />
+            <span className="hidden sm:inline">Scan Folder</span>
           </button>
-          <input ref={fileInputRef} type="file" multiple accept="audio/*" className="hidden" onChange={handleFileSelect} />
+          <input 
+            ref={fileInputRef} 
+            type="file" 
+            multiple 
+            className="hidden" 
+            onChange={handleFileSelect} 
+            {...({ webkitdirectory: "", directory: "" } as any)}
+          />
         </div>
       </header>
 
@@ -460,7 +712,7 @@ export default function App() {
         <NavButton icon={<Music />} label="Tracks" active={activeTab === 'tracks'} onClick={() => setActiveTab('tracks')} />
         <NavButton icon={<LayoutGrid />} label="Albums" active={activeTab === 'albums'} onClick={() => setActiveTab('albums')} />
         <NavButton icon={<Users />} label="Artists" active={activeTab === 'artists'} onClick={() => setActiveTab('artists')} />
-        <NavButton icon={<Music />} label="Genres" active={activeTab === 'genres'} onClick={() => setActiveTab('genres')} />
+        <NavButton icon={<Heart />} label="Favorites" active={activeTab === 'favorites'} onClick={() => setActiveTab('favorites')} />
         <NavButton icon={<List />} label="Playlists" active={activeTab === 'playlists'} onClick={() => setActiveTab('playlists')} />
         <NavButton icon={<Folder />} label="Folders" active={activeTab === 'folders'} onClick={() => setActiveTab('folders')} />
         <NavButton icon={<Settings />} label="Settings" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
@@ -468,7 +720,7 @@ export default function App() {
 
       {/* Mini-Player / Full-Screen Player */}
       <AnimatePresence>
-        {currentTrack && (
+        {currentTrack && selectedTrackIds.size === 0 && (
           <motion.div 
             layout
             initial={{ y: 100 }}
@@ -483,7 +735,16 @@ export default function App() {
                 <div className="flex justify-between items-center mb-8">
                   <button onClick={() => setIsPlayerExpanded(false)} className="p-2 hover:bg-white/10 rounded-full"><Minimize2 /></button>
                   <h2 className="text-sm font-bold tracking-widest text-white/40 uppercase">Now Playing</h2>
-                  <button className="p-2 hover:bg-white/10 rounded-full"><MoreHorizontal /></button>
+                  <div className="flex items-center gap-2">
+                    <button 
+                      onClick={() => setIsEQModalOpen(true)}
+                      className="p-2 hover:bg-white/10 rounded-full transition-colors"
+                      title="Equalizer"
+                    >
+                      <Settings size={20} />
+                    </button>
+                    <button className="p-2 hover:bg-white/10 rounded-full"><MoreHorizontal /></button>
+                  </div>
                 </div>
 
                 <div className="flex-1 flex flex-col md:flex-row gap-12 items-center overflow-hidden">
@@ -510,7 +771,15 @@ export default function App() {
                   <div className="w-full md:w-96 h-full flex flex-col bg-white/5 rounded-3xl border border-white/10 overflow-hidden">
                     <div className="p-4 border-b border-white/10 flex items-center justify-between">
                       <h3 className="font-bold flex items-center gap-2"><List size={18} /> Up Next</h3>
-                      <span className="text-xs text-white/40">{nowPlayingQueue.length} tracks</span>
+                      <div className="flex items-center gap-3">
+                        <span className="text-xs text-white/40">{nowPlayingQueue.length} tracks</span>
+                        <button 
+                          onClick={clearQueue}
+                          className="text-xs text-red-500 hover:text-red-400 font-bold uppercase tracking-widest transition-colors"
+                        >
+                          Clear
+                        </button>
+                      </div>
                     </div>
                     <div className="flex-1 overflow-y-auto p-2 custom-scrollbar">
                       <Reorder.Group axis="y" values={nowPlayingQueue} onReorder={setNowPlayingQueue} className="space-y-1">
@@ -533,7 +802,7 @@ export default function App() {
                                 e.stopPropagation();
                                 const newQueue = nowPlayingQueue.filter(track => track.id !== t.id);
                                 setNowPlayingQueue(newQueue);
-                                if (currentIndex === idx) playNext();
+                                if (currentIndex === idx) skipNext();
                                 else if (currentIndex > idx) setCurrentIndex(currentIndex - 1);
                               }}
                               className="p-1 text-white/20 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all"
@@ -577,7 +846,7 @@ export default function App() {
                     >
                       {isPlaying ? <Pause size={40} fill="currentColor" /> : <Play size={40} fill="currentColor" className="ml-2" />}
                     </button>
-                    <button onClick={playNext} className="text-white hover:scale-110 transition-transform"><SkipForward size={48} fill="currentColor" /></button>
+                    <button onClick={skipNext} className="text-white hover:scale-110 transition-transform"><SkipForward size={48} fill="currentColor" /></button>
                     <button onClick={() => setIsRepeat(!isRepeat)} className={cn("transition-colors", isRepeat ? "text-emerald-500" : "text-white/40 hover:text-white")}><Repeat size={24} /></button>
                   </div>
                 </div>
@@ -606,7 +875,7 @@ export default function App() {
                   >
                     {isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" className="ml-1" />}
                   </button>
-                  <button onClick={playNext} className="text-white/60 hover:text-white transition-colors"><SkipForward size={24} fill="currentColor" /></button>
+                  <button onClick={skipNext} className="text-white/60 hover:text-white transition-colors"><SkipForward size={24} fill="currentColor" /></button>
                   <button onClick={() => setIsPlayerExpanded(true)} className="p-2 text-white/40 hover:text-white"><Maximize2 size={18} /></button>
                 </div>
 
@@ -631,6 +900,231 @@ export default function App() {
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 bg-black/80 backdrop-blur-md z-[110] flex flex-col items-center justify-center gap-6">
             <div className="w-16 h-16 border-4 border-emerald-500/20 border-t-emerald-500 rounded-full animate-spin" />
             <p className="text-lg font-medium">Processing Library...</p>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* New Playlist Modal */}
+      <AnimatePresence>
+        {isNewPlaylistModalOpen && (
+          <motion.div 
+            initial={{ opacity: 0 }} 
+            animate={{ opacity: 1 }} 
+            exit={{ opacity: 0 }} 
+            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[120] flex items-center justify-center p-4"
+            onClick={() => setIsNewPlaylistModalOpen(false)}
+          >
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="w-full max-w-md bg-zinc-900 border border-white/10 rounded-3xl p-8 shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h2 className="text-2xl font-bold mb-6">Create New Playlist</h2>
+              <input 
+                autoFocus
+                type="text" 
+                placeholder="Playlist Name"
+                value={newPlaylistName}
+                onChange={(e) => setNewPlaylistName(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && createPlaylist()}
+                className="w-full bg-white/5 border border-white/10 rounded-xl py-3 px-4 mb-8 focus:outline-none focus:border-emerald-500 transition-colors"
+              />
+              <div className="flex gap-4">
+                <button 
+                  onClick={() => setIsNewPlaylistModalOpen(false)}
+                  className="flex-1 py-3 bg-white/5 hover:bg-white/10 rounded-xl font-semibold transition-colors"
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={createPlaylist}
+                  className="flex-1 py-3 bg-emerald-500 text-black hover:bg-emerald-400 rounded-xl font-semibold transition-colors"
+                >
+                  Create
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Add to Playlist Modal */}
+      <AnimatePresence>
+        {isAddToPlaylistModalOpen && (
+          <motion.div 
+            initial={{ opacity: 0 }} 
+            animate={{ opacity: 1 }} 
+            exit={{ opacity: 0 }} 
+            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[120] flex items-center justify-center p-4"
+            onClick={() => setIsAddToPlaylistModalOpen(false)}
+          >
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="w-full max-w-md bg-zinc-900 border border-white/10 rounded-3xl p-8 shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h2 className="text-2xl font-bold mb-2">Add to Playlist</h2>
+              <p className="text-white/40 mb-6 truncate">
+                {tracksToAddToPlaylist.length === 1 
+                  ? `"${tracksToAddToPlaylist[0].title}"` 
+                  : `${tracksToAddToPlaylist.length} tracks selected`}
+              </p>
+              
+              <div className="space-y-4 mb-8">
+                {playlists.length === 0 ? (
+                  <p className="text-center py-8 text-white/20 italic">No playlists found</p>
+                ) : (
+                  <div className="space-y-4">
+                    <div className="relative">
+                      <select 
+                        value={selectedPlaylistId}
+                        onChange={(e) => setSelectedPlaylistId(e.target.value)}
+                        className="w-full p-4 bg-white/5 border border-white/10 rounded-xl appearance-none focus:outline-none focus:border-emerald-500/50 transition-colors cursor-pointer"
+                      >
+                        <option value="" disabled className="bg-zinc-900">Select a playlist...</option>
+                        {playlists.map(p => (
+                          <option key={p.id} value={p.id} className="bg-zinc-900">
+                            {p.name} ({p.trackIds.length} tracks)
+                          </option>
+                        ))}
+                      </select>
+                      <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-white/40">
+                        <ChevronRight size={20} className="rotate-90" />
+                      </div>
+                    </div>
+
+                    <button 
+                      disabled={!selectedPlaylistId}
+                      onClick={() => {
+                        addTrackToPlaylist(selectedPlaylistId);
+                        setSelectedPlaylistId('');
+                      }}
+                      className={cn(
+                        "w-full py-4 rounded-xl font-bold flex items-center justify-center gap-2 transition-all",
+                        selectedPlaylistId 
+                          ? "bg-emerald-500 text-black hover:bg-emerald-400" 
+                          : "bg-white/5 text-white/20 cursor-not-allowed"
+                      )}
+                    >
+                      <Plus size={20} />
+                      Add to Selected Playlist
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex gap-4">
+                <button 
+                  onClick={() => {
+                    setIsAddToPlaylistModalOpen(false);
+                    setSelectedPlaylistId('');
+                  }}
+                  className="flex-1 py-3 bg-white/5 hover:bg-white/10 rounded-xl font-semibold transition-colors"
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={() => {
+                    setIsAddToPlaylistModalOpen(false);
+                    setSelectedPlaylistId('');
+                    setIsNewPlaylistModalOpen(true);
+                  }}
+                  className="flex-1 py-3 bg-emerald-500/10 text-emerald-500 border border-emerald-500/20 hover:bg-emerald-500 hover:text-black rounded-xl font-semibold transition-all"
+                >
+                  New Playlist
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Delete Confirmation Modal */}
+      <AnimatePresence>
+        {isDeleteConfirmationModalOpen && (
+          <motion.div 
+            initial={{ opacity: 0 }} 
+            animate={{ opacity: 1 }} 
+            exit={{ opacity: 0 }} 
+            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[130] flex items-center justify-center p-4"
+            onClick={() => setIsDeleteConfirmationModalOpen(false)}
+          >
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="w-full max-w-md bg-zinc-900 border border-white/10 rounded-3xl p-8 shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="w-16 h-16 bg-red-500/10 rounded-2xl flex items-center justify-center text-red-500 mb-6">
+                <Trash2 size={32} />
+              </div>
+              <h2 className="text-2xl font-bold mb-2">Delete Tracks?</h2>
+              <p className="text-white/40 mb-8">
+                Are you sure you want to delete {selectedTrackIds.size} tracks? This will permanently remove them from your library and all playlists.
+              </p>
+              
+              <div className="flex gap-4">
+                <button 
+                  onClick={() => setIsDeleteConfirmationModalOpen(false)}
+                  className="flex-1 py-3 bg-white/5 hover:bg-white/10 rounded-xl font-semibold transition-colors"
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={confirmBulkDelete}
+                  className="flex-1 py-3 bg-red-500 text-white hover:bg-red-400 rounded-xl font-semibold transition-colors"
+                >
+                  Delete
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Selection Toolbar */}
+      <AnimatePresence>
+        {selectedTrackIds.size > 0 && (
+          <motion.div 
+            initial={{ y: 100, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: 100, opacity: 0 }}
+            className="fixed bottom-24 left-1/2 -translate-x-1/2 z-40 bg-zinc-900 border border-emerald-500/30 rounded-2xl px-6 py-4 flex items-center gap-8 shadow-2xl backdrop-blur-xl"
+          >
+            <div className="flex items-center gap-3 pr-8 border-r border-white/10">
+              <div className="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center text-black font-bold text-sm">
+                {selectedTrackIds.size}
+              </div>
+              <span className="font-medium">Selected</span>
+            </div>
+            
+            <div className="flex items-center gap-4">
+              <button 
+                onClick={handleBulkAddToPlaylist}
+                className="flex items-center gap-2 px-4 py-2 hover:bg-white/5 rounded-xl transition-colors"
+              >
+                <Plus size={18} className="text-emerald-500" />
+                <span>Add to Playlist</span>
+              </button>
+              <button 
+                onClick={handleBulkDelete}
+                className="flex items-center gap-2 px-4 py-2 hover:bg-red-500/10 text-red-500 rounded-xl transition-colors"
+              >
+                <Trash2 size={18} />
+                <span>Delete</span>
+              </button>
+              <button 
+                onClick={() => setSelectedTrackIds(new Set())}
+                className="p-2 hover:bg-white/5 rounded-xl transition-colors text-white/40"
+              >
+                <X size={18} />
+              </button>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -663,38 +1157,126 @@ function NavButton({ icon, label, active, onClick }: { icon: React.ReactNode, la
   );
 }
 
-function TrackItem({ track, isActive, onClick, isPlaying }: { track: Track, isActive: boolean, onClick: () => void, isPlaying: boolean }) {
+function TrackItem({ 
+  track, isActive, isSelected, isFavorite, onClick, onSelect, onToggleFavorite, isPlaying, onAddToPlaylist, onPlayNext, onAddToQueue 
+}: { 
+  track: Track, isActive: boolean, isSelected: boolean, isFavorite: boolean, onClick: () => void, onSelect: () => void, onToggleFavorite: () => void, isPlaying: boolean, onAddToPlaylist: () => void, onPlayNext: () => void, onAddToQueue: () => void 
+}) {
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+
   return (
-    <button
-      onClick={onClick}
+    <div
       className={cn(
-        "w-full p-3 rounded-xl flex items-center gap-4 transition-all group",
-        isActive ? "bg-emerald-500/10 border border-emerald-500/20" : "hover:bg-white/5 border border-transparent"
+        "w-full p-3 rounded-xl flex items-center gap-4 transition-all group relative",
+        isActive ? "bg-emerald-500/10 border border-emerald-500/20" : "hover:bg-white/5 border border-transparent",
+        isSelected && "bg-emerald-500/20 border-emerald-500/40"
       )}
     >
-      <div className="w-12 h-12 rounded-lg bg-white/5 flex-shrink-0 overflow-hidden flex items-center justify-center relative">
-        {track.coverUrl ? (
-          <img src={track.coverUrl} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-        ) : (
-          <Music size={20} className="text-white/20" />
-        )}
-        {isActive && isPlaying && (
-          <div className="absolute inset-0 bg-black/40 flex items-center justify-center">
-            <div className="flex gap-0.5 items-end h-4">
-              <motion.div animate={{ height: [4, 16, 4] }} transition={{ repeat: Infinity, duration: 0.6 }} className="w-0.5 bg-emerald-500" />
-              <motion.div animate={{ height: [10, 4, 10] }} transition={{ repeat: Infinity, duration: 0.8 }} className="w-0.5 bg-emerald-500" />
-              <motion.div animate={{ height: [4, 12, 4] }} transition={{ repeat: Infinity, duration: 0.7 }} className="w-0.5 bg-emerald-500" />
+      <div className="flex items-center gap-3">
+        <button 
+          onClick={(e) => {
+            e.stopPropagation();
+            onSelect();
+          }}
+          className={cn(
+            "w-5 h-5 rounded border transition-all flex items-center justify-center",
+            isSelected ? "bg-emerald-500 border-emerald-500" : "border-white/20 group-hover:border-white/40"
+          )}
+        >
+          {isSelected && <Check size={14} className="text-black" />}
+        </button>
+        <div 
+          onClick={onClick}
+          className="w-12 h-12 rounded-lg bg-white/5 flex-shrink-0 overflow-hidden flex items-center justify-center relative cursor-pointer"
+        >
+          {track.coverUrl ? (
+            <img src={track.coverUrl} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+          ) : (
+            <Music size={20} className="text-white/20" />
+          )}
+          {isActive && isPlaying && (
+            <div className="absolute inset-0 bg-black/40 flex items-center justify-center">
+              <div className="flex gap-0.5 items-end h-4">
+                <motion.div animate={{ height: [4, 16, 4] }} transition={{ repeat: Infinity, duration: 0.6 }} className="w-0.5 bg-emerald-500" />
+                <motion.div animate={{ height: [10, 4, 10] }} transition={{ repeat: Infinity, duration: 0.8 }} className="w-0.5 bg-emerald-500" />
+                <motion.div animate={{ height: [4, 12, 4] }} transition={{ repeat: Infinity, duration: 0.7 }} className="w-0.5 bg-emerald-500" />
+              </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
-      <div className="flex-1 text-left overflow-hidden">
+      <div onClick={onClick} className="flex-1 text-left overflow-hidden cursor-pointer">
         <p className={cn("font-medium truncate", isActive ? "text-emerald-400" : "text-white")}>{track.title}</p>
         <p className="text-sm text-white/40 truncate">{track.artist} • {track.album}</p>
       </div>
-      <div className="text-xs font-mono text-white/20">{formatTime(track.duration)}</div>
-      <button className="p-2 text-white/20 hover:text-white opacity-0 group-hover:opacity-100 transition-opacity"><MoreHorizontal size={18} /></button>
-    </button>
+      
+      <div className="flex items-center gap-3">
+        <button 
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggleFavorite();
+          }}
+          className={cn(
+            "p-2 transition-all",
+            isFavorite ? "text-red-500" : "text-white/10 hover:text-white/40"
+          )}
+        >
+          <motion.div whileTap={{ scale: 1.5 }}>
+            <Heart size={18} fill={isFavorite ? "currentColor" : "none"} />
+          </motion.div>
+        </button>
+        
+        <div className="text-xs font-mono text-white/20 hidden sm:block">{formatTime(track.duration)}</div>
+        
+        <div className="relative">
+          <button 
+            onClick={(e) => {
+              e.stopPropagation();
+              setIsMenuOpen(!isMenuOpen);
+            }}
+            className="p-2 text-white/20 hover:text-white hover:bg-white/10 rounded-lg transition-all"
+          >
+            <MoreHorizontal size={18} />
+          </button>
+          
+          <AnimatePresence>
+            {isMenuOpen && (
+              <>
+                <div className="fixed inset-0 z-[100]" onClick={() => setIsMenuOpen(false)} />
+                <motion.div 
+                  initial={{ opacity: 0, scale: 0.95, y: 10 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.95, y: 10 }}
+                  className="absolute right-0 bottom-full mb-2 w-48 bg-zinc-900 border border-white/10 rounded-xl shadow-2xl z-[101] overflow-hidden"
+                >
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); onPlayNext(); setIsMenuOpen(false); }}
+                    className="w-full p-3 text-left hover:bg-white/5 flex items-center gap-3 text-sm"
+                  >
+                    <Zap size={16} className="text-emerald-500" />
+                    Play Next
+                  </button>
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); onAddToQueue(); setIsMenuOpen(false); }}
+                    className="w-full p-3 text-left hover:bg-white/5 flex items-center gap-3 text-sm"
+                  >
+                    <List size={16} className="text-emerald-500" />
+                    Add to Queue
+                  </button>
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); onAddToPlaylist(); setIsMenuOpen(false); }}
+                    className="w-full p-3 text-left hover:bg-white/5 flex items-center gap-3 text-sm"
+                  >
+                    <Plus size={16} className="text-emerald-500" />
+                    Add to Playlist
+                  </button>
+                </motion.div>
+              </>
+            )}
+          </AnimatePresence>
+        </div>
+      </div>
+    </div>
   );
 }
 
