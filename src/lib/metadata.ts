@@ -20,7 +20,7 @@ export async function extractMetadata(file: File): Promise<Partial<Track>> {
       genre: common.genre?.[0] || 'Unknown Genre',
       duration: format.duration || 0,
       coverUrl,
-      format: file.type || 'audio/unknown',
+      format: format.container || file.type || 'audio/unknown',
       trackNumber: common.track.no || undefined,
       path: (file as any).webkitRelativePath || file.name,
     };

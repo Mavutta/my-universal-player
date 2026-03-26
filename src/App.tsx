@@ -12,18 +12,13 @@ import { motion, AnimatePresence, Reorder } from 'motion/react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { Track, Playlist, AudioSettings, PlayerState } from './lib/types';
 import { extractMetadata } from './lib/metadata';
-import { isNativelySupported, decodeToWav } from './lib/audio';
+import { isNativelySupported, decodeToWav, isLossless } from './lib/audio';
 import { cn, formatTime } from './lib/utils';
 import Visualizer from './components/Visualizer';
+import AudioConsole from './components/AudioConsole';
 import { AudioEngine } from './lib/audioEngine';
 import { db } from './lib/db';
-
-const EQ_PRESETS = {
-  Flat: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-  'Bass Boost': [8, 6, 4, 2, 0, 0, 0, 0, 0, 0],
-  Vocal: [-2, -1, 0, 2, 4, 4, 2, 0, -1, -2],
-  Electronic: [6, 4, 0, -2, -2, 0, 2, 4, 6, 8],
-};
+import { EQ_PRESETS } from './lib/constants';
 
 export default function App() {
   // --- Persistence ---
@@ -60,10 +55,32 @@ export default function App() {
   // Audio Settings
   const [audioSettings, setAudioSettings] = useState<AudioSettings>(() => {
     const saved = localStorage.getItem('audioSettings');
-    return saved ? JSON.parse(saved) : {
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        // Basic validation to ensure we don't have NaN in critical numeric fields
+        if (
+          Array.isArray(parsed.eqGains) && 
+          parsed.eqGains.every((v: any) => typeof v === 'number' && Number.isFinite(v)) &&
+          typeof parsed.preAmpGain === 'number' && Number.isFinite(parsed.preAmpGain) &&
+          typeof parsed.stereoWidenerAmount === 'number' && Number.isFinite(parsed.stereoWidenerAmount)
+        ) {
+          return parsed;
+        }
+      } catch (e) {
+        console.error('Failed to parse audio settings', e);
+      }
+    }
+    return {
       eqGains: EQ_PRESETS.Flat,
+      preAmpGain: 0,
       isReverbEnabled: false,
       isCompressionEnabled: true,
+      isLimiterEnabled: true,
+      isStereoWidenerEnabled: false,
+      isMonoEnabled: false,
+      isNormalizationEnabled: true,
+      stereoWidenerAmount: 0.5,
       crossfadeTime: 0, // Default to gapless (0s)
     };
   });
@@ -82,7 +99,6 @@ export default function App() {
     if (audio1Ref.current && audio2Ref.current && !engineRef.current) {
       engineRef.current = new AudioEngine(audio1Ref.current, audio2Ref.current);
       engineRef.current.setEQ(audioSettings.eqGains);
-      engineRef.current.setReverb(audioSettings.isReverbEnabled);
       engineRef.current.setCompression(audioSettings.isCompressionEnabled);
     }
   }, []);
@@ -91,8 +107,12 @@ export default function App() {
     localStorage.setItem('audioSettings', JSON.stringify(audioSettings));
     if (engineRef.current) {
       engineRef.current.setEQ(audioSettings.eqGains);
-      engineRef.current.setReverb(audioSettings.isReverbEnabled);
+      engineRef.current.setPreAmp(audioSettings.preAmpGain);
       engineRef.current.setCompression(audioSettings.isCompressionEnabled);
+      engineRef.current.setLimiter(audioSettings.isLimiterEnabled);
+      engineRef.current.setStereoWidener(audioSettings.isStereoWidenerEnabled, audioSettings.stereoWidenerAmount);
+      engineRef.current.setMono(audioSettings.isMonoEnabled);
+      engineRef.current.setNormalization(audioSettings.isNormalizationEnabled);
     }
   }, [audioSettings]);
 
@@ -160,7 +180,10 @@ export default function App() {
     setIsLoading(true);
     const newTracks: Track[] = [];
     for (const file of files) {
-      if (!file.type.startsWith('audio/') && !file.name.match(/\.(mp3|wav|ogg|flac|m4a)$/i)) continue;
+      const ext = file.name.split('.').pop()?.toLowerCase();
+      const supportedExts = ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac', 'wma', 'webm'];
+      
+      if (!file.type.startsWith('audio/') && (!ext || !supportedExts.includes(ext))) continue;
       
       const metadata = await extractMetadata(file);
       const track: Track = {
@@ -172,7 +195,7 @@ export default function App() {
         genre: metadata.genre || 'Unknown Genre',
         duration: metadata.duration || 0,
         coverUrl: metadata.coverUrl,
-        format: metadata.format || file.type,
+        format: metadata.format || file.type || ext || 'unknown',
         trackNumber: metadata.trackNumber,
         path: (file as any).webkitRelativePath || file.name,
         isFavorite: false
@@ -642,6 +665,8 @@ export default function App() {
         );
       case 'settings':
         return <SettingsView settings={audioSettings} onUpdate={setAudioSettings} onReset={() => db.tracks.clear()} />;
+      case 'console':
+        return <AudioConsole settings={audioSettings} onUpdate={setAudioSettings} analyzer={engineRef.current?.getAnalyzer() || null} />;
       default:
         return null;
     }
@@ -708,15 +733,18 @@ export default function App() {
       </main>
 
       {/* Bottom Navigation */}
-      <nav className="h-20 bg-white/5 backdrop-blur-2xl border-t border-white/10 flex items-center justify-around px-6 z-30">
-        <NavButton icon={<Music />} label="Tracks" active={activeTab === 'tracks'} onClick={() => setActiveTab('tracks')} />
-        <NavButton icon={<LayoutGrid />} label="Albums" active={activeTab === 'albums'} onClick={() => setActiveTab('albums')} />
-        <NavButton icon={<Users />} label="Artists" active={activeTab === 'artists'} onClick={() => setActiveTab('artists')} />
-        <NavButton icon={<Heart />} label="Favorites" active={activeTab === 'favorites'} onClick={() => setActiveTab('favorites')} />
-        <NavButton icon={<List />} label="Playlists" active={activeTab === 'playlists'} onClick={() => setActiveTab('playlists')} />
-        <NavButton icon={<Folder />} label="Folders" active={activeTab === 'folders'} onClick={() => setActiveTab('folders')} />
-        <NavButton icon={<Settings />} label="Settings" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
-      </nav>
+      <div className="relative z-30">
+        <nav className="h-20 bg-white/5 backdrop-blur-2xl border-t border-white/10 flex items-center md:justify-around justify-start overflow-x-auto no-scrollbar px-6 scroll-smooth nav-mask md:[mask-image:none]">
+          <NavButton icon={<Music />} label="Tracks" active={activeTab === 'tracks'} onClick={() => setActiveTab('tracks')} />
+          <NavButton icon={<LayoutGrid />} label="Albums" active={activeTab === 'albums'} onClick={() => setActiveTab('albums')} />
+          <NavButton icon={<Users />} label="Artists" active={activeTab === 'artists'} onClick={() => setActiveTab('artists')} />
+          <NavButton icon={<Heart />} label="Favorites" active={activeTab === 'favorites'} onClick={() => setActiveTab('favorites')} />
+          <NavButton icon={<List />} label="Playlists" active={activeTab === 'playlists'} onClick={() => setActiveTab('playlists')} />
+          <NavButton icon={<Folder />} label="Folders" active={activeTab === 'folders'} onClick={() => setActiveTab('folders')} />
+          <NavButton icon={<Zap />} label="Console" active={activeTab === 'console'} onClick={() => setActiveTab('console')} />
+          <NavButton icon={<Settings />} label="Settings" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
+        </nav>
+      </div>
 
       {/* Mini-Player / Full-Screen Player */}
       <AnimatePresence>
@@ -762,7 +790,12 @@ export default function App() {
                       </div>
                     </div>
                     <div className="text-center">
-                      <h2 className="text-4xl font-bold mb-2">{currentTrack.title}</h2>
+                      <div className="flex items-center justify-center gap-3 mb-2">
+                        <h2 className="text-4xl font-bold">{currentTrack.title}</h2>
+                        {isLossless(currentTrack.format, currentTrack.file.name) && (
+                          <span className="px-2 py-0.5 bg-emerald-500/10 text-emerald-500 text-[10px] font-bold rounded uppercase tracking-widest border border-emerald-500/20">Hi-Res</span>
+                        )}
+                      </div>
                       <p className="text-xl text-white/40">{currentTrack.artist}</p>
                     </div>
                   </div>
@@ -862,7 +895,12 @@ export default function App() {
                     )}
                   </div>
                   <div className="overflow-hidden">
-                    <h4 className="font-semibold truncate">{currentTrack.title}</h4>
+                    <div className="flex items-center gap-2">
+                      <h4 className="font-semibold truncate">{currentTrack.title}</h4>
+                      {isLossless(currentTrack.format, currentTrack.file.name) && (
+                        <span className="px-1.5 py-0.5 bg-emerald-500/10 text-emerald-500 text-[8px] font-bold rounded uppercase tracking-widest border border-emerald-500/20 flex-shrink-0">Hi-Res</span>
+                      )}
+                    </div>
                     <p className="text-sm text-white/40 truncate">{currentTrack.artist}</p>
                   </div>
                 </div>
@@ -1134,6 +1172,9 @@ export default function App() {
         .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
         .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 10px; }
         .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+        .nav-mask { mask-image: linear-gradient(to right, black 85%, transparent 100%); }
       `}</style>
     </div>
   );
@@ -1142,11 +1183,20 @@ export default function App() {
 // --- Sub-components ---
 
 function NavButton({ icon, label, active, onClick }: { icon: React.ReactNode, label: string, active: boolean, onClick: () => void }) {
+  const ref = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (active && ref.current) {
+      ref.current.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+    }
+  }, [active]);
+
   return (
     <button 
+      ref={ref}
       onClick={onClick}
       className={cn(
-        "flex flex-col items-center gap-1 transition-all group relative px-4",
+        "flex flex-col items-center gap-1 transition-all group relative px-4 min-w-[72px] flex-shrink-0",
         active ? "text-emerald-500" : "text-white/40 hover:text-white"
       )}
     >
@@ -1206,7 +1256,12 @@ function TrackItem({
         </div>
       </div>
       <div onClick={onClick} className="flex-1 text-left overflow-hidden cursor-pointer">
-        <p className={cn("font-medium truncate", isActive ? "text-emerald-400" : "text-white")}>{track.title}</p>
+        <div className="flex items-center gap-2">
+          <p className={cn("font-medium truncate", isActive ? "text-emerald-400" : "text-white")}>{track.title}</p>
+          {isLossless(track.format, track.file.name) && (
+            <span className="px-1 py-0.5 bg-emerald-500/10 text-emerald-500 text-[7px] font-bold rounded uppercase tracking-widest border border-emerald-500/20 flex-shrink-0">Hi-Res</span>
+          )}
+        </div>
         <p className="text-sm text-white/40 truncate">{track.artist} • {track.album}</p>
       </div>
       
@@ -1323,7 +1378,15 @@ function FolderBrowser({ tree, onPlayTrack }: { tree: any, onPlayTrack: (t: Trac
             className="w-full p-4 rounded-xl hover:bg-white/5 flex items-center gap-4 transition-colors group"
           >
             <Music className="text-white/20 group-hover:text-emerald-500 transition-colors" size={24} />
-            <span className="font-medium">{t.title}</span>
+            <div className="flex flex-col items-start overflow-hidden">
+              <div className="flex items-center gap-2">
+                <span className="font-medium truncate">{t.title}</span>
+                {isLossless(t.format, t.file.name) && (
+                  <span className="px-1 py-0.5 bg-emerald-500/10 text-emerald-500 text-[7px] font-bold rounded uppercase tracking-widest border border-emerald-500/20 flex-shrink-0">Hi-Res</span>
+                )}
+              </div>
+              <span className="text-xs text-white/40 truncate">{t.artist}</span>
+            </div>
             <span className="ml-auto text-xs font-mono text-white/20">{formatTime(t.duration)}</span>
           </button>
         ))}
