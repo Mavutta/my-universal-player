@@ -1,0 +1,5 @@
+{
+  "name": "Aura Universal Player",
+  "description": "A beautiful, universal music player with WASM-powered decoding and glassmorphic design.",
+  "requestFramePermissions": []
+}

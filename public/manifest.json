@@ -1,0 +1,21 @@
+{
+  "name": "Aura Player",
+  "short_name": "Aura",
+  "description": "Universal Music Player",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0a0a",
+  "theme_color": "#10b981",
+  "icons": [
+    {
+      "src": "https://picsum.photos/seed/aura/192/192",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://picsum.photos/seed/aura/512/512",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
