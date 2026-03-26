@@ -17,10 +17,12 @@ export async function extractMetadata(file: File): Promise<Partial<Track>> {
       title: common.title || file.name.replace(/\.[^/.]+$/, ""),
       artist: common.artist || 'Unknown Artist',
       album: common.album || 'Unknown Album',
+      genre: common.genre?.[0] || 'Unknown Genre',
       duration: format.duration || 0,
       coverUrl,
       format: file.type || 'audio/unknown',
       trackNumber: common.track.no || undefined,
+      path: (file as any).webkitRelativePath || file.name,
     };
   } catch (error) {
     console.error('Error extracting metadata:', error);

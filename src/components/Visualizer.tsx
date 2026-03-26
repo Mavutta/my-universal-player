@@ -1,30 +1,17 @@
 import React, { useEffect, useRef } from 'react';
 
 interface VisualizerProps {
-  audioRef: React.RefObject<HTMLAudioElement | null>;
+  analyzer: AnalyserNode | null;
   isPlaying: boolean;
 }
 
-export default function Visualizer({ audioRef, isPlaying }: VisualizerProps) {
+export default function Visualizer({ analyzer, isPlaying }: VisualizerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animationRef = useRef<number>(0);
-  const analyzerRef = useRef<AnalyserNode | null>(null);
-  const sourceRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const contextRef = useRef<AudioContext | null>(null);
 
   useEffect(() => {
-    if (!audioRef.current || !canvasRef.current) return;
+    if (!analyzer || !canvasRef.current) return;
 
-    if (!contextRef.current) {
-      contextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-      analyzerRef.current = contextRef.current.createAnalyser();
-      sourceRef.current = contextRef.current.createMediaElementSource(audioRef.current);
-      sourceRef.current.connect(analyzerRef.current);
-      analyzerRef.current.connect(contextRef.current.destination);
-    }
-
-    const analyzer = analyzerRef.current!;
-    analyzer.fftSize = 256;
     const bufferLength = analyzer.frequencyBinCount;
     const dataArray = new Uint8Array(bufferLength);
 
@@ -38,27 +25,27 @@ export default function Visualizer({ audioRef, isPlaying }: VisualizerProps) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
       const barWidth = (canvas.width / bufferLength) * 2.5;
-      let barHeight;
       let x = 0;
 
       for (let i = 0; i < bufferLength; i++) {
-        barHeight = (dataArray[i] / 255) * canvas.height;
+        const barHeight = (dataArray[i] / 255) * canvas.height;
 
-        const gradient = ctx.createLinearGradient(0, canvas.height, 0, 0);
-        gradient.addColorStop(0, 'rgba(16, 185, 129, 0.2)');
-        gradient.addColorStop(1, 'rgba(16, 185, 129, 0.8)');
+        const gradient = ctx.createLinearGradient(0, canvas.height - barHeight, 0, canvas.height);
+        gradient.addColorStop(0, '#10b981'); // emerald-500
+        gradient.addColorStop(1, 'rgba(16, 185, 129, 0.1)');
 
         ctx.fillStyle = gradient;
-        ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+        
+        // Rounded top for bars
+        ctx.beginPath();
+        ctx.roundRect(x, canvas.height - barHeight, barWidth, barHeight, [4, 4, 0, 0]);
+        ctx.fill();
 
-        x += barWidth + 1;
+        x += barWidth + 2;
       }
     };
 
     if (isPlaying) {
-      if (contextRef.current.state === 'suspended') {
-        contextRef.current.resume();
-      }
       draw();
     } else {
       cancelAnimationFrame(animationRef.current);
@@ -67,14 +54,14 @@ export default function Visualizer({ audioRef, isPlaying }: VisualizerProps) {
     return () => {
       cancelAnimationFrame(animationRef.current);
     };
-  }, [audioRef, isPlaying]);
+  }, [analyzer, isPlaying]);
 
   return (
     <canvas 
       ref={canvasRef} 
-      width={300} 
-      height={60} 
-      className="w-full h-16 opacity-50"
+      width={600} 
+      height={120} 
+      className="w-full h-24 opacity-40 pointer-events-none"
     />
   );
 }
